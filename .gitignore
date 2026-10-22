@@ -1,0 +1,80 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+
+# Virtual environments and dependencies
+.venv/
+venv/
+env/
+ENV/
+node_modules/
+
+# Test and coverage output
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Generated datasets
+data/raw/
+data/processed/
+data/intermediate/
+data/features/
+data/external/
+*.csv
+*.xlsx
+*.parquet
+
+# JSON is ignored by default; explicitly allow project configuration below
+*.json
+!configs/*.json
+
+# Logs and generated reports
+logs/
+*.log
+reports/
+
+# Model artifacts: allow only the existing deployment files
+models/*
+*.pkl
+*.joblib
+*.h5
+*.pt
+*.pth
+!models/churn_model.joblib
+!models/decision_policy.json
+!models/model_metadata.json
+
+# Secrets and environment files
+.env
+.env.*
+*.pem
+*.key
+*.secret
+secrets/
+secrets.*
+credentials/
+credentials.*
+
+# IDE and OS files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.DS_Store
+Thumbs.db
+desktop.ini
+.ipynb_checkpoints/
+*.ipynb
+*.spec

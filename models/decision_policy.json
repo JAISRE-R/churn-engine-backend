@@ -1,0 +1,11 @@
+{
+  "selected_threshold": 0.5,
+  "selection_criteria": "Maximize F1-score while controlling False Positive Rate",
+  "fpr": 0.1957,
+  "fnr": 0.2414,
+  "precision": 0.7097,
+  "recall": 0.7586,
+  "f1": 0.7333,
+  "mcc": 0.5567,
+  "business_justification": "Threshold 0.50 optimizes retention targeting efficiency. It achieves F1=0.7333 with FPR=0.1957 (limiting costly unnecessary discount overrides) and FNR=0.2414 (catching high-risk churners)."
+}

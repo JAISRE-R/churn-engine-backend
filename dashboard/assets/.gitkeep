@@ -1,0 +1,5 @@
+# dashboard/assets/.gitkeep
+# This directory stores static dashboard assets:
+# - Custom CSS overrides (phase2_styles.css)
+# - Logo images and icons
+# - Any static data files for embedded charts

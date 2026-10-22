@@ -1,0 +1,36 @@
+# Core data science
+pandas==2.2.3
+numpy==2.2.6
+scipy==1.15.3
+
+# Machine learning
+scikit-learn==1.6.1
+xgboost==2.1.4
+joblib==1.4.2
+
+# Visualization
+matplotlib==3.10.3
+seaborn==0.13.2
+plotly==6.1.2
+
+# API
+fastapi==0.115.12
+uvicorn==0.34.2
+
+# Dashboard
+streamlit==1.45.1
+
+# Utilities
+python-dotenv==1.1.0
+pydantic==2.11.5
+PyYAML==6.0.2
+tqdm==4.67.1
+colorlog==6.9.0
+
+# Testing
+pytest==8.3.5
+pytest-cov==6.1.1
+
+# Linting / formatting
+black==25.1.0
+ruff==0.11.13

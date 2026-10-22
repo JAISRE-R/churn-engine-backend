@@ -1,0 +1,140 @@
+# ============================================================
+# configs/config.yaml
+# Main Configuration — Live Churn Risk Assessment Engine
+# Phase 1: Foundation
+# ============================================================
+
+project:
+  name: "Live Churn Risk Assessment Engine"
+  version: "1.0.0-phase1"
+  description: >
+    Real-time customer churn prediction with recommendation
+    override capabilities for e-commerce platforms.
+  environment: "development"          # development | staging | production
+
+# ----------------------------------------------------------
+# Paths (relative to project root)
+# ----------------------------------------------------------
+paths:
+  data_raw:          "data/raw"
+  data_intermediate: "data/intermediate"
+  data_processed:    "data/processed"
+  data_features:     "data/features"
+  models:            "models"
+  logs:              "logs"
+  reports:           "reports"
+  configs:           "configs"
+  assets:            "dashboard/assets"
+
+# ----------------------------------------------------------
+# Data Configuration
+# Phase 2: Persona-driven synthetic dataset settings
+# ----------------------------------------------------------
+data:
+  raw_filename:       "raw_events.csv"
+  target_column:      "churn"       # Binary label: 1 = churned, 0 = retained
+  customer_id_column: "customer_id"
+  date_column:        "event_timestamp"
+  train_split:        0.70
+  val_split:          0.15
+  test_split:         0.15
+  random_seed:        42
+
+# ----------------------------------------------------------
+# Feature Engineering
+# ----------------------------------------------------------
+feature_engineering:
+  recency_window_days:     30
+  frequency_window_days:   90
+  rolling_windows:         [7, 14, 30]  # days
+  categorical_encoding:    "label"       # label | onehot | target
+  scaling_method:          "standard"    # standard | minmax | robust
+
+# ----------------------------------------------------------
+# Model Configuration
+# TODO Phase 3: tune hyperparameters after baseline evaluation
+# ----------------------------------------------------------
+model:
+  type:               "xgboost"        # xgboost | random_forest | logistic
+  model_filename:     "churn_model.joblib"
+  hyperparameters:
+    n_estimators:     200
+    max_depth:        6
+    learning_rate:    0.05
+    subsample:        0.8
+    colsample_bytree: 0.8
+    use_label_encoder: false
+    eval_metric:      "logloss"
+    random_state:     42
+
+# ----------------------------------------------------------
+# Churn Decision Gate
+# ----------------------------------------------------------
+decision_gate:
+  churn_threshold:        0.65   # Probability above which override fires
+  high_risk_threshold:    0.80   # Extreme risk tier
+  medium_risk_lower:      0.45   # Medium-risk band (lower bound)
+  medium_risk_upper:      0.65   # Medium-risk band (upper bound)
+
+# ----------------------------------------------------------
+# Event Stream (Phase 4)
+# ----------------------------------------------------------
+event_stream:
+  source:             "simulated"   # simulated | kafka | redis | websocket
+  simulation_rate_hz: 2.0           # events per second in simulation mode
+  buffer_size:        1000          # max events held in memory
+  event_frequency:    2.0           # target frequency of events (events/sec)
+  simulation_speed:   1.0           # speed multiplier (e.g. 1.0 = real-time, 5.0 = accelerated)
+  random_seed:        42            # deterministic random seed for events
+  max_recent_events:  1000          # max events in rolling buffer
+  risk_history_size:  100           # max prediction score points retained per customer
+  stream_refresh_interval: 1.0      # live dashboard poll interval in seconds
+  event_types:
+    - "page_view"
+    - "product_click"
+    - "add_to_cart"
+    - "remove_from_cart"
+    - "purchase"
+    - "search"
+    - "session_end"
+    - "support_contact"
+
+# ----------------------------------------------------------
+# Recommendation Engine (Phase 6)
+# ----------------------------------------------------------
+recommender:
+  normal_strategy:    "collaborative_filtering"  # Phase 6
+  top_n:              10
+  override:
+    retention_strategy: "discount_offers"         # Phase 5
+    max_offers:         5
+    offer_types:
+      - "percentage_discount"
+      - "free_shipping"
+      - "loyalty_points"
+      - "product_bundle"
+    medium_risk_discount: 0.05
+    high_risk_discount: 0.15
+    critical_risk_discount: 0.25
+
+# ----------------------------------------------------------
+# Dashboard
+# ----------------------------------------------------------
+dashboard:
+  title:           "Churn Risk Assessment — Live Dashboard"
+  refresh_interval_sec: 5
+  theme:           "dark"          # dark | light
+  chart_height:    400
+  max_stream_rows: 500             # rows visible in live event table
+
+# ----------------------------------------------------------
+# Logging
+# ----------------------------------------------------------
+logging:
+  level:       "INFO"              # DEBUG | INFO | WARNING | ERROR
+  to_file:     true
+  log_filename: "churn_engine.log"
+  max_bytes:   10_485_760          # 10 MB
+  backup_count: 5
+  format:      "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+  datefmt:     "%Y-%m-%d %H:%M:%S"
