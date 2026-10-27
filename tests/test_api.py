@@ -761,10 +761,13 @@ def test_production_requires_explicit_demo_cors_and_ledger_config(
         "override_engine": app.state.override_engine,
     }
 
-    with pytest.raises(RuntimeError, match="CHECKOUT_LEDGER_PATH"):
+    with pytest.raises(
+        RuntimeError,
+        match=r"CHECKOUT_LEDGER_PATH.*\/tmp\/checkout_ledger\.sqlite3",
+    ):
         create_app(**dependencies)
 
-    temporary_path = tmp_path / "render-ephemeral" / "checkout.sqlite3"
+    temporary_path = tmp_path / "render-free-tier-tmp" / "checkout_ledger.sqlite3"
     temporary_path.parent.mkdir()
     monkeypatch.setenv("CHECKOUT_LEDGER_PATH", str(temporary_path))
     production_app = create_app(**dependencies)

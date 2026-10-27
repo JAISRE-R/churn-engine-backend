@@ -477,7 +477,9 @@ def create_app(
         if production:
             if not configured_ledger_path:
                 raise RuntimeError(
-                    "CHECKOUT_LEDGER_PATH must be explicitly configured in production"
+                    "CHECKOUT_LEDGER_PATH must be explicitly configured in production; "
+                    "for a Render free-tier demo, set it to "
+                    "/tmp/checkout_ledger.sqlite3"
                 )
             ledger_path = Path(configured_ledger_path).expanduser()
             if not ledger_path.is_absolute() or not ledger_path.parent.is_dir():
