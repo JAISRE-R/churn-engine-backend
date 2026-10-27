@@ -136,6 +136,12 @@ streamlit run app.py
 
 Open your browser at **http://localhost:8501**
 
+To connect Live Storefront Activity Feed to the deployed backend, set the
+Streamlit secret `API_BASE_URL` to the deployed HTTPS backend URL. In
+production, the dashboard requires this secret and does not fall back to
+localhost. For local development, omit the secret to use the default
+`http://127.0.0.1:8000` backend.
+
 ---
 
 ## Phase Roadmap
@@ -160,6 +166,27 @@ Edit `configs/config.yaml` to adjust:
 - **model paths** — where serialised models are stored
 - **data paths** — locations of raw and processed data
 - **logging level** — DEBUG / INFO / WARNING
+
+### Production checkout storage (Render)
+
+Checkout finalizations and redeemed product offers are stored transactionally
+in SQLite. For Render, attach a persistent disk to the backend service (for
+example mounted at `/var/data`) and configure:
+
+```text
+CHURN_ENVIRONMENT=production
+CHURN_LOCAL_DEMO_MODE=false
+CORS_ORIGINS=https://<published-storefront-origin>
+CHECKOUT_LEDGER_PATH=/var/data/checkout_ledger.sqlite3
+```
+
+The API refuses production startup if the demo flag, public CORS origins, or
+ledger path is missing or invalid. The ledger path's parent must already exist,
+which prevents silently falling back to an ephemeral filesystem. SQLite on a
+Render persistent disk supports transactional retries and concurrent requests
+for a single backend instance; do not scale this service to multiple instances
+or workers sharing the ledger. Use a shared transactional database before
+horizontal scaling.
 
 ---
 

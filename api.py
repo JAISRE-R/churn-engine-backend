@@ -38,14 +38,16 @@ import os
 import sys
 import uuid
 import logging
+import json
 from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 # Ensure project root is on sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -58,6 +60,12 @@ from src.predictor import ChurnPredictor
 from src.decision_gate import DecisionGate
 from src.recommender import BaselineRecommender
 from src.override_engine import OverrideEngine
+from src.checkout_ledger import CheckoutLedger
+from src.demo_mode import (
+    DEMO_AT_RISK_CUSTOMERS,
+    demo_classification,
+    local_demo_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -138,7 +146,7 @@ def resolve_region(customer_id: str, country: str | None = None) -> str:
 
 def adapt_recommendations(
     raw_recommendations: list[dict[str, Any]],
-    overall_discount: int = 0
+    offers_authorized: bool = False,
 ) -> list[dict[str, Any]]:
     """Adapt backend recommendation product IDs to valid frontend catalog products.
     
@@ -146,7 +154,7 @@ def adapt_recommendations(
     - If rec product_id is in frontend catalog (P-1001..P-1036), keep it intact.
     - If non-catalog ID (e.g. P-101, COUPON-CRIT-25), resolve deterministically
       to a valid catalog product from the matching category.
-    - Preserves backend reason, discount, and original ranking order.
+    - Preserves backend reason, authorized product-level discounts, and ranking.
     - Avoids duplicate product IDs in the returned list.
     """
     adapted: list[dict[str, Any]] = []
@@ -159,9 +167,14 @@ def adapt_recommendations(
         category = str(category_val).strip() if category_val is not None and not (isinstance(category_val, float) and pd.isna(category_val)) else "General"
         reason_val = rec.get("reason")
         reason = str(reason_val).strip() if reason_val is not None and not (isinstance(reason_val, float) and pd.isna(reason_val)) else "Recommended for you"
-        item_discount = rec.get("discount")
-        if item_discount is None:
-            item_discount = overall_discount
+        item_discount = rec.get("discount", 0)
+        if (
+            not offers_authorized
+            or pid not in VALID_CATALOG_SET
+            or not isinstance(item_discount, (int, float))
+            or not 0 < item_discount <= 100
+        ):
+            item_discount = 0
 
         # 1. Direct hit in catalog
         if pid in VALID_CATALOG_SET and pid not in used_ids:
@@ -216,6 +229,24 @@ class EventRequest(BaseModel):
     metadata: Optional[dict[str, Any]] = Field(default_factory=dict)
 
 
+class CheckoutLineRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    product_id: str
+    quantity: int = Field(ge=1, le=99)
+
+
+class CheckoutRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    customer_id: str = Field(..., min_length=1)
+    lines: list[CheckoutLineRequest] = Field(..., min_length=1, max_length=36)
+
+
+class CheckoutFinalizeRequest(CheckoutRequest):
+    order_id: str = Field(..., min_length=1, max_length=128)
+
+
 class RecommendationItem(BaseModel):
     product_id: str
     reason: Optional[str] = None
@@ -234,6 +265,8 @@ class CustomerExperienceResponse(BaseModel):
     message: Optional[str] = None
     recommendation_type: Optional[str] = None
     recommendations: list[RecommendationItem] = []
+    demo_mode: bool = False
+    demo_classification: Optional[Literal["DEMO_AT_RISK", "DEMO_NOT_AT_RISK"]] = None
 
 
 class LiveEventRecord(BaseModel):
@@ -267,6 +300,58 @@ class HealthResponse(BaseModel):
     model_type: str
     threshold: float
     customers_loaded: int
+
+
+class CheckoutLineResponse(BaseModel):
+    product_id: str
+    quantity: int
+    unit_price: float
+    discount_percent: int
+    discount_value: float
+    line_total: float
+
+
+class CheckoutQuoteResponse(BaseModel):
+    customer_id: str
+    lines: list[CheckoutLineResponse]
+    subtotal: float
+    discount_value: float
+    shipping: float
+    tax: float
+    total: float
+
+
+class CheckoutFinalizationResponse(CheckoutQuoteResponse):
+    order_id: str
+    retention_offer_status: Literal["REDEEMED", "NOT_REDEEMED"]
+    demo_mode: bool
+    experience: CustomerExperienceResponse
+
+
+CATALOG_PRICES: dict[str, Decimal] = {
+    "P-1001": Decimal("1449"), "P-1002": Decimal("2199"),
+    "P-1003": Decimal("749"), "P-1004": Decimal("1099"),
+    "P-1005": Decimal("549"), "P-1006": Decimal("1699"),
+    "P-1007": Decimal("329"), "P-1008": Decimal("219"),
+    "P-1009": Decimal("179"), "P-1010": Decimal("119"),
+    "P-1011": Decimal("399"), "P-1012": Decimal("129"),
+    "P-1013": Decimal("749"), "P-1014": Decimal("199"),
+    "P-1015": Decimal("69"), "P-1016": Decimal("129"),
+    "P-1017": Decimal("89"), "P-1018": Decimal("149"),
+    "P-1019": Decimal("79"), "P-1020": Decimal("45"),
+    "P-1021": Decimal("59"), "P-1022": Decimal("89"),
+    "P-1023": Decimal("549"), "P-1024": Decimal("899"),
+    "P-1025": Decimal("279"), "P-1026": Decimal("89"),
+    "P-1027": Decimal("159"), "P-1028": Decimal("139"),
+    "P-1029": Decimal("649"), "P-1030": Decimal("289"),
+    "P-1031": Decimal("219"), "P-1032": Decimal("249"),
+    "P-1033": Decimal("99"), "P-1034": Decimal("179"),
+    "P-1035": Decimal("149"), "P-1036": Decimal("349"),
+}
+
+
+def round_money(value: Decimal) -> Decimal:
+    return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
 from collections import deque
@@ -312,6 +397,7 @@ def create_app(
     recommender: Optional[BaselineRecommender] = None,
     override_engine: Optional[OverrideEngine] = None,
     live_event_buffer: Optional[LiveEventBuffer] = None,
+    checkout_ledger: Optional[CheckoutLedger] = None,
 ) -> FastAPI:
     """Create and configure the FastAPI application."""
     if config is None:
@@ -327,11 +413,35 @@ def create_app(
     )
 
     # CORS configuration
-    cors_origins_env = os.getenv(
-        "CORS_ORIGINS",
-        "http://localhost:8080,http://localhost:5173,http://localhost:3000,http://127.0.0.1:8080,http://127.0.0.1:5173"
-    )
-    allowed_origins = [origin.strip() for origin in cors_origins_env.split(",") if origin.strip()]
+    production = os.getenv("CHURN_ENVIRONMENT", "").casefold() == "production"
+    cors_origins_env = os.getenv("CORS_ORIGINS")
+    if production:
+        if os.getenv("CHURN_LOCAL_DEMO_MODE", "").casefold() != "false":
+            raise RuntimeError(
+                "CHURN_LOCAL_DEMO_MODE=false must be explicitly configured in production"
+            )
+        if not cors_origins_env:
+            raise RuntimeError("CORS_ORIGINS must be configured in production")
+    else:
+        cors_origins_env = cors_origins_env or (
+            "http://localhost:8080,http://localhost:5173,http://localhost:3000,"
+            "http://127.0.0.1:8080,http://127.0.0.1:5173"
+        )
+    allowed_origins = [
+        origin.strip() for origin in cors_origins_env.split(",") if origin.strip()
+    ]
+    if production and (
+        not allowed_origins
+        or any(
+            not origin.casefold().startswith("https://")
+            or "localhost" in origin.casefold()
+            or "127.0.0.1" in origin
+            for origin in allowed_origins
+        )
+    ):
+        raise RuntimeError(
+            "Production CORS_ORIGINS must contain public HTTPS frontend origins only"
+        )
 
     app.add_middleware(
         CORSMiddleware,
@@ -349,10 +459,32 @@ def create_app(
     app.state.recommender = recommender or BaselineRecommender(config)
     app.state.override_engine = override_engine or OverrideEngine(config)
     app.state.live_event_buffer = live_event_buffer or LiveEventBuffer(maxlen=1000)
+    app.state.local_demo_enabled = local_demo_enabled(config)
+    if checkout_ledger is None:
+        configured_ledger_path = os.getenv("CHECKOUT_LEDGER_PATH")
+        if production:
+            if not configured_ledger_path:
+                raise RuntimeError(
+                    "CHECKOUT_LEDGER_PATH must point to a Render persistent disk in production"
+                )
+            ledger_path = Path(configured_ledger_path).expanduser()
+            if not ledger_path.is_absolute() or not ledger_path.parent.is_dir():
+                raise RuntimeError(
+                    "CHECKOUT_LEDGER_PATH must be an absolute path on an attached persistent disk"
+                )
+        else:
+            ledger_path = (
+                Path(configured_ledger_path).expanduser()
+                if configured_ledger_path
+                else PROJECT_ROOT / "data" / "checkout_ledger.sqlite3"
+            )
+        checkout_ledger = CheckoutLedger(ledger_path)
+    app.state.checkout_ledger = checkout_ledger
 
     def execute_churn_pipeline(
         customer_id: str,
-        reference_date: Optional[datetime] = None
+        reference_date: Optional[datetime] = None,
+        redeemed_product_ids: Optional[set[str]] = None,
     ) -> CustomerExperienceResponse:
         """Run the exact sequence: Features -> Predictor -> Gate -> Recommender -> Override."""
         sm: CustomerStateManager = app.state.state_manager
@@ -388,15 +520,28 @@ def create_app(
         base_recs = recom.recommend(customer_id, cust_history)
 
         # 5. Override Engine
+        demo_active = app.state.local_demo_enabled
+        demo_class = demo_classification(customer_id) if demo_active else None
+        offers_allowed = not demo_active or customer_id in DEMO_AT_RISK_CUSTOMERS
+        if redeemed_product_ids is None:
+            redeemed_product_ids = app.state.checkout_ledger.get_redeemed_product_ids(
+                customer_id
+            )
         final_recs = override.process(
             baseline_recs=base_recs,
             decision_res=decision_res,
-            customer_events=cust_history
+            customer_events=cust_history,
+            offers_allowed=offers_allowed,
+            redeemed_product_ids=redeemed_product_ids,
         )
 
         # 6. Build response
-        is_override = final_recs.get("strategy") == "RETENTION_OVERRIDE"
-        discount_pct = int(final_recs.get("metadata", {}).get("discount_pct", 0))
+        is_override = (
+            final_recs.get("strategy") == "RETENTION_OVERRIDE"
+            and decision_res.get("decision") == "INTERVENTION_REQUIRED"
+            and offers_allowed
+        )
+        tier_discount_pct = int(final_recs.get("metadata", {}).get("discount_pct", 0))
 
         # Look up country for customer
         country = cust_history[0].get("country", "") if cust_history else ""
@@ -404,16 +549,24 @@ def create_app(
 
         if is_override:
             headline = "Special offer for you"
-            message = f"Complete your purchase and save {discount_pct}% on selected items."
             rec_type = "retention_offer"
         else:
             headline = "Recommended for you"
-            message = None
             rec_type = "personalized"
 
         adapted_items = adapt_recommendations(
             final_recs.get("recommendations", []),
-            overall_discount=discount_pct
+            offers_authorized=is_override,
+        )
+        has_product_offer = any(item["discount"] > 0 for item in adapted_items)
+        message = (
+            f"Save {tier_discount_pct}% on selected products."
+            if is_override and has_product_offer
+            else (
+                "We have recommendations based on your activity."
+                if is_override
+                else None
+            )
         )
 
         return CustomerExperienceResponse(
@@ -422,12 +575,14 @@ def create_app(
             churn_probability=prob,
             risk_level=risk_lvl,
             decision=decision_res.get("decision", "NORMAL"),
-            strategy=final_recs.get("strategy", "BASELINE"),
-            discount=discount_pct,
+            strategy="RETENTION_OVERRIDE" if is_override else "BASELINE",
+            discount=0,
             headline=headline,
             message=message,
             recommendation_type=rec_type,
             recommendations=[RecommendationItem(**item) for item in adapted_items],
+            demo_mode=demo_active,
+            demo_classification=demo_class,
         )
 
     # -----------------------------------------------------------------------
@@ -546,6 +701,159 @@ def create_app(
         
         # Query experience without mutating history
         return execute_churn_pipeline(customer_id.strip())
+
+    def build_checkout_quote(
+        customer_id: str,
+        lines: list[CheckoutLineRequest],
+        redeemed_product_ids: Optional[set[str]] = None,
+    ) -> CheckoutQuoteResponse:
+        for line in lines:
+            if line.product_id not in CATALOG_PRICES:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Unknown product_id: {line.product_id}",
+                )
+
+        experience = execute_churn_pipeline(
+            customer_id, redeemed_product_ids=redeemed_product_ids
+        )
+        authorized_offers: dict[str, int] = {}
+        if (
+            experience.decision == "INTERVENTION_REQUIRED"
+            and experience.strategy == "RETENTION_OVERRIDE"
+        ):
+            authorized_offers = {
+                recommendation.product_id: recommendation.discount
+                for recommendation in experience.recommendations
+                if recommendation.product_id in CATALOG_PRICES
+                and recommendation.discount is not None
+                and 0 < recommendation.discount <= 100
+            }
+
+        quoted_lines: list[CheckoutLineResponse] = []
+        subtotal = Decimal("0")
+        discount_total = Decimal("0")
+        for line in lines:
+            unit_price = CATALOG_PRICES[line.product_id]
+            discount_percent = authorized_offers.get(line.product_id, 0)
+            original_line_total = unit_price * line.quantity
+            line_discount = round_money(
+                original_line_total * Decimal(discount_percent) / Decimal("100")
+            )
+            final_line_total = original_line_total - line_discount
+            subtotal += original_line_total
+            discount_total += line_discount
+            quoted_lines.append(
+                CheckoutLineResponse(
+                    product_id=line.product_id,
+                    quantity=line.quantity,
+                    unit_price=float(unit_price),
+                    discount_percent=discount_percent,
+                    discount_value=float(line_discount),
+                    line_total=float(final_line_total),
+                )
+            )
+
+        discounted_subtotal = subtotal - discount_total
+        shipping = (
+            Decimal("0")
+            if discounted_subtotal == 0 or discounted_subtotal >= Decimal("75")
+            else Decimal("9.95")
+        )
+        tax = round_money(discounted_subtotal * Decimal("0.08"))
+        total = round_money(discounted_subtotal + shipping + tax)
+
+        return CheckoutQuoteResponse(
+            customer_id=customer_id,
+            lines=quoted_lines,
+            subtotal=float(subtotal),
+            discount_value=float(discount_total),
+            shipping=float(shipping),
+            tax=float(tax),
+            total=float(total),
+        )
+
+    @app.post("/api/checkout/quote", response_model=CheckoutQuoteResponse)
+    def checkout_quote(req: CheckoutRequest):
+        customer_id = req.customer_id.strip()
+        if not customer_id:
+            raise HTTPException(status_code=400, detail="customer_id must not be empty")
+        return build_checkout_quote(customer_id, req.lines)
+
+    @app.post(
+        "/api/checkout/finalize",
+        response_model=CheckoutFinalizationResponse,
+    )
+    def finalize_checkout(req: CheckoutFinalizeRequest):
+        customer_id = req.customer_id.strip()
+        order_id = req.order_id.strip()
+        if not customer_id:
+            raise HTTPException(status_code=400, detail="customer_id must not be empty")
+        if not order_id:
+            raise HTTPException(status_code=400, detail="order_id must not be empty")
+
+        signature = json.dumps(
+            {
+                "customer_id": customer_id,
+                "lines": sorted(
+                    (line.product_id, line.quantity) for line in req.lines
+                ),
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        ledger: CheckoutLedger = app.state.checkout_ledger
+        with ledger.transaction() as connection:
+            previous = ledger.get_finalization(connection, order_id)
+            if previous:
+                if (
+                    previous["customer_id"] != customer_id
+                    or previous["request_signature"] != signature
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="order_id was already used for a different checkout",
+                    )
+                return CheckoutFinalizationResponse.model_validate_json(
+                    previous["response_json"]
+                )
+
+            redeemed_product_ids = ledger.get_redeemed_product_ids(
+                customer_id, connection
+            )
+            quote = build_checkout_quote(
+                customer_id,
+                req.lines,
+                redeemed_product_ids=redeemed_product_ids,
+            )
+            newly_redeemed_product_ids = {
+                line.product_id for line in quote.lines if line.discount_percent > 0
+            }
+
+            refreshed_experience = execute_churn_pipeline(
+                customer_id,
+                redeemed_product_ids=(
+                    redeemed_product_ids | newly_redeemed_product_ids
+                ),
+            )
+            finalized = CheckoutFinalizationResponse(
+                **quote.model_dump(),
+                order_id=order_id,
+                retention_offer_status=(
+                    "REDEEMED" if quote.discount_value > 0 else "NOT_REDEEMED"
+                ),
+                demo_mode=app.state.local_demo_enabled,
+                experience=refreshed_experience,
+            )
+            ledger.save_finalization(
+                connection,
+                order_id=order_id,
+                customer_id=customer_id,
+                request_signature=signature,
+                response_json=finalized.model_dump_json(),
+                redeemed_product_ids=newly_redeemed_product_ids,
+            )
+            return finalized
 
     @app.get("/api/admin/events/recent", response_model=AdminRecentEventsResponse)
     def get_admin_recent_events(limit: int = 50):

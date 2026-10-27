@@ -20,6 +20,7 @@ from collections import deque
 from datetime import datetime
 from typing import Any
 
+from src.demo_mode import DEMO_AT_RISK_CUSTOMERS, local_demo_enabled
 from src.recommender import get_product_category
 
 logger = logging.getLogger(__name__)
@@ -47,7 +48,9 @@ class OverrideEngine:
         self,
         baseline_recs: dict[str, Any],
         decision_res: dict[str, Any],
-        customer_events: list[dict[str, Any]] | None = None
+        customer_events: list[dict[str, Any]] | None = None,
+        offers_allowed: bool = True,
+        redeemed_product_ids: set[str] | None = None,
     ) -> dict[str, Any]:
         """Intercept baseline recommendations and apply overrides if necessary.
 
@@ -59,6 +62,10 @@ class OverrideEngine:
             Gate decision dict from DecisionGate.
         customer_events : list[dict[str, Any]] | None
             Log of customer behavioural events.
+        offers_allowed : bool
+            Server-computed authorization for the current customer.
+        redeemed_product_ids : set[str] | None
+            Product IDs whose retention offer was already redeemed.
 
         Returns
         -------
@@ -67,8 +74,12 @@ class OverrideEngine:
         """
         # Read activation decision from the Decision Gate
         override_triggered = decision_res.get("decision") == "INTERVENTION_REQUIRED"
+        offers_allowed = offers_allowed and (
+            not local_demo_enabled(self.config)
+            or baseline_recs["customer_id"] in DEMO_AT_RISK_CUSTOMERS
+        )
         
-        if not override_triggered:
+        if not override_triggered or not offers_allowed:
             # Pass-through baseline unchanged
             return {
                 "customer_id": baseline_recs["customer_id"],
@@ -80,7 +91,11 @@ class OverrideEngine:
                     "risk_level": decision_res.get("risk_level", "LOW"),
                     "churn_probability": decision_res.get("churn_probability", 0.0),
                     "threshold": decision_res.get("threshold", 0.40),
-                    "override_reason": "Risk probability below threshold",
+                    "override_reason": (
+                        "Retention offers are not authorized for this customer"
+                        if override_triggered and not offers_allowed
+                        else "Risk probability below threshold"
+                    ),
                 }
             }
 
@@ -106,7 +121,6 @@ class OverrideEngine:
         # Parse behavioral signals
         abandoned_pids = []
         viewed_pids = []
-        fav_cat = "General"
 
         if customer_events:
             # Cart abandonments (added to cart, never purchased)
@@ -120,80 +134,32 @@ class OverrideEngine:
                 if pid and pid not in viewed_pids:
                     viewed_pids.append(pid)
 
-            # Determine favorite category
-            categories = [get_product_category(pid) for pid in viewed_pids]
-            if categories:
-                import pandas as pd
-                fav_cat = pd.Series(categories).mode()[0]
-
         # Formulate strategies based on risk tier
         if risk_lvl == "CRITICAL":
-            # 1. strong discount coupon offer
-            recs.append({
-                "product_id": "COUPON-CRIT-25",
-                "category": fav_cat,
-                "reason": f"Loyalty Offer: Get {discount*100:.0f}% Off Next Order",
-                "score": 0.99,
-            })
-            seen.add("COUPON-CRIT-25")
-
-            # 2. Add bundle offer (if they viewed an item, pair it, else generic bundle)
+            # Bundle recommendations remain recommendations, not cart-wide offers.
             base_product = viewed_pids[0] if viewed_pids else "P-101"
             bundle_pid = f"{base_product}-BNDL"
             recs.append({
                 "product_id": bundle_pid,
                 "category": get_product_category(base_product),
-                "reason": f"Bundle Deal: {base_product} + Accessories ({discount*100:.0f}% Off)",
+                "reason": f"Bundle Deal: {base_product} + Accessories",
                 "score": 0.95,
             })
             seen.add(bundle_pid)
 
-            # 3. Add abandoned product or recently viewed
-            for pid in (abandoned_pids + viewed_pids):
-                if pid not in seen:
-                    seen.add(pid)
-                    recs.append({
-                        "product_id": pid,
-                        "category": get_product_category(pid),
-                        "reason": f"Saved Item Review: {discount*100:.0f}% discount applied",
-                        "score": 0.90,
-                    })
-                    break
-        else:
-            # MEDIUM or HIGH Risk Override
-            # 1. soft coupon/discount
+        # Offers belong to specific previously viewed or abandoned products.
+        eligible_pids = list(dict.fromkeys(abandoned_pids + viewed_pids))
+        for pid in eligible_pids:
+            if pid in seen or pid in (redeemed_product_ids or set()):
+                continue
+            seen.add(pid)
             recs.append({
-                "product_id": f"COUPON-SOFT-{int(discount*100)}",
-                "category": fav_cat,
-                "reason": f"Special Offer: Save {discount*100:.0f}% on your next visit",
-                "score": 0.92,
+                "product_id": pid,
+                "category": get_product_category(pid),
+                "reason": f"Retention offer: save {discount*100:.0f}% on this item",
+                "score": 0.92 if pid in abandoned_pids else 0.85,
+                "discount": int(discount * 100),
             })
-            seen.add(f"COUPON-SOFT-{int(discount*100)}")
-
-            # 2. Add abandoned products
-            for pid in abandoned_pids:
-                if pid not in seen:
-                    seen.add(pid)
-                    recs.append({
-                        "product_id": pid,
-                        "category": get_product_category(pid),
-                        "reason": "Complete Your Cart - Discount Active!",
-                        "score": 0.88,
-                    })
-                    break
-
-            # 3. Add recently viewed product
-            for pid in viewed_pids:
-                if len(recs) >= 3:
-                    break
-                if pid not in seen:
-                    seen.add(pid)
-                    recs.append({
-                        "product_id": pid,
-                        "category": get_product_category(pid),
-                        "reason": "Still interested? Check it out again",
-                        "score": 0.85,
-                    })
 
         # Fill remaining slots with category-specific or baseline items
         for item in baseline_recs["recommendations"]:

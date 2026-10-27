@@ -32,9 +32,9 @@ def render() -> None:
 
     st.markdown("""
     <div class="page-header">
-        <h1 class="page-title">Intervention Audit Log &amp; Lifecycle Timeline</h1>
+        <h1 class="page-title">Intervention Audit Logs</h1>
         <p class="page-subtitle">
-            Historical ledger and end-to-end traceability of churn detection, Decision Gate overrides, and simulated customer responses.
+        In-memory records from the current dashboard runtime. Simulated responses are labeled separately.
         </p>
     </div>
     """, unsafe_allow_html=True)
@@ -97,7 +97,7 @@ def render() -> None:
     display_df["threshold"] = display_df["threshold"].map(lambda x: f"{x:.2%}")
     display_df["discount_value"] = display_df["discount_value"].map(lambda x: f"{x:.0%}" if x > 0 else "0%")
     display_df.columns = [
-        "Timestamp", "Customer ID", "Churn Prob", "Threshold", "Risk Level", "Strategy", "Discount Applied", "Override Reason"
+        "Timestamp", "Customer ID", "Churn Prob", "Threshold", "Risk Level", "Strategy", "Configured discount rate", "Override Reason"
     ]
 
     st.markdown("### 📋 Override Intervention Records")
@@ -126,20 +126,20 @@ def render() -> None:
         prob = float(rec["churn_probability"])
         thresh = float(rec["threshold"])
         risk_lvl = rec["risk_level"]
-        discount_val = float(rec.get("discount_value", 0.15))
-        persona = get_customer_persona(cid)
+        discount_record = rec.get("discount_value")
+        resp = None
+        if discount_record is not None and pd.notna(discount_record):
+            sim = InterventionSimulator(config=st.session_state.config, random_seed=42)
+            resp = sim.simulate_single_event_response(
+                customer_id=cid,
+                churn_probability=prob,
+                risk_level=risk_lvl,
+                discount_offered=float(discount_record),
+                persona=get_customer_persona(cid),
+            )
+        discount_val = float(discount_record) if discount_record is not None and pd.notna(discount_record) else None
 
-        # Simulate response outcome using InterventionSimulator
-        sim = InterventionSimulator(config=st.session_state.config, random_seed=42)
-        resp = sim.simulate_single_event_response(
-            customer_id=cid,
-            churn_probability=prob,
-            risk_level=risk_lvl,
-            discount_offered=discount_val,
-            persona=persona,
-        )
-
-        st.markdown(f"#### Pipeline Audit Trail: Customer `{cid}` ({persona.title()}) at `{selected_ts}`")
+        st.markdown(f"#### Pipeline record: Customer `{cid}` at `{selected_ts}`")
 
         # Visual 6-Step Timeline Cards
         steps = [
@@ -162,7 +162,7 @@ def render() -> None:
             {
                 "num": "3",
                 "stage": "Decision Gate Middleware",
-                "summary": f"Flagged ({prob:.2%} ≥ {thresh:.2%})",
+                "summary": f"Recorded gate decision ({prob:.2%} vs. {thresh:.2%})",
                 "detail": "Intervention requirement verified against authoritative policy threshold.",
                 "color": "#cf222e",
                 "bg": "#ffebe9",
@@ -178,18 +178,29 @@ def render() -> None:
             {
                 "num": "5",
                 "stage": "Retention Override Engine",
-                "summary": f"Incentive: {int(discount_val*100)}% Discount Coupon",
-                "detail": f"Replaced baseline items with coupon code and retention product bundles.",
+                "summary": (
+                    f"Configured tier rate: {discount_val:.0%}"
+                    if discount_val is not None else "Configured tier rate unavailable"
+                ),
+                "detail": "See the recorded recommended product IDs below; this page does not infer a cart-wide offer.",
                 "color": "#0969da",
                 "bg": "#ddf4ff",
             },
             {
                 "num": "6",
-                "stage": "Simulated Customer Response",
-                "summary": f"Outcome: {resp['outcome_status'].replace('_', ' ')}",
-                "detail": f"Simulated Revenue: ${resp['simulated_revenue']:.2f} | Discount Cost: ${resp['discount_cost']:.2f} | Margin: +${resp['margin_contribution']:.2f}",
-                "color": "#1a7f37" if resp["simulated_converted"] else "#656d76",
-                "bg": "#dafbe1" if resp["simulated_converted"] else "#f6f8fa",
+                "stage": "Simulated response (not observed)",
+                "summary": (
+                    f"Simulated outcome: {resp['outcome_status'].replace('_', ' ')}"
+                    if resp else "Unavailable"
+                ),
+                "detail": (
+                    f"Simulated revenue: ${resp['simulated_revenue']:.2f} | "
+                    f"Discount cost: ${resp['discount_cost']:.2f} | "
+                    f"Margin: ${resp['margin_contribution']:+.2f}"
+                    if resp else "No recorded discount value is available for this simulation."
+                ),
+                "color": "#1a7f37" if resp and resp["simulated_converted"] else "#656d76",
+                "bg": "#dafbe1" if resp and resp["simulated_converted"] else "#f6f8fa",
             },
         ]
 

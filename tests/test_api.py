@@ -7,9 +7,11 @@ Unit and integration tests for FastAPI thin bridge (api.py).
 from __future__ import annotations
 
 import pytest
+from concurrent.futures import ThreadPoolExecutor
 from fastapi.testclient import TestClient
 
 from api import app, create_app, VALID_CATALOG_SET, resolve_region, adapt_recommendations
+from src.checkout_ledger import CheckoutLedger
 from src.utils import load_config
 from src.event_stream import CustomerStateManager
 from src.predictor import ChurnPredictor
@@ -19,9 +21,15 @@ from src.override_engine import OverrideEngine
 
 
 @pytest.fixture
-def client():
+def client(tmp_path, monkeypatch):
     """TestClient instance with the main application."""
-    return TestClient(app)
+    monkeypatch.setattr(
+        app.state,
+        "checkout_ledger",
+        CheckoutLedger(tmp_path / "checkout_ledger.sqlite3"),
+    )
+    with TestClient(app) as test_client:
+        yield test_client
 
 
 def test_health_endpoint(client):
@@ -165,6 +173,20 @@ def test_valid_frontend_product_ids(client):
         )
 
 
+def test_adapt_recommendations_preserves_only_authorized_product_offers():
+    recs = [
+        {"product_id": "P-1001", "discount": 15},
+        {"product_id": "P-1002"},
+        {"product_id": "COUPON-CRIT-25", "discount": 25, "category": "Laptops"},
+    ]
+
+    authorized = adapt_recommendations(recs, offers_authorized=True)
+    assert [item["discount"] for item in authorized] == [15, 0, 0]
+
+    baseline = adapt_recommendations(recs, offers_authorized=False)
+    assert all(item["discount"] == 0 for item in baseline)
+
+
 def test_region_mapping():
     """Test 10: Region mapping resolves countries and IDs deterministically."""
     assert resolve_region("C-1000", "US") == "North America"
@@ -289,6 +311,492 @@ def test_live_event_buffer_thread_safety():
     assert len(buf.get_recent(limit=500)) == 250
 
 
+def _stub_checkout_pipeline(monkeypatch, *, decision, risk_level, events):
+    class StateManager:
+        customer_history = {"C-CHECKOUT": events}
+
+        def get_features(self, customer_id, reference_date=None):
+            return {}
+
+        def update_state(self, event):
+            self.customer_history.setdefault(event.customer_id, []).append({
+                "product_id": event.product_id,
+                "event_type": event.event_type,
+                "event_timestamp": event.event_timestamp,
+            })
+
+    class Predictor:
+        def predict(self, customer_id, features):
+            return {
+                "churn_probability": 0.8 if decision == "INTERVENTION_REQUIRED" else 0.1,
+                "risk_level": risk_level,
+            }
+
+    class Gate:
+        def get_history(self):
+            return []
+
+        def decide(self, **kwargs):
+            return {
+                "customer_id": kwargs["customer_id"],
+                "churn_probability": kwargs["churn_probability"],
+                "threshold": 0.4,
+                "decision": decision,
+                "risk_level": risk_level,
+            }
+
+    class Recommender:
+        def recommend(self, customer_id, customer_events):
+            return {
+                "customer_id": customer_id,
+                "recommendations": [
+                    {
+                        "product_id": "P-1002",
+                        "category": "Laptops",
+                        "reason": "Baseline",
+                        "score": 0.8,
+                    }
+                ],
+                "strategy": "BASELINE",
+                "timestamp": "2026-01-01 10:00:00",
+            }
+
+    monkeypatch.setattr(app.state, "state_manager", StateManager())
+    monkeypatch.setattr(app.state, "predictor", Predictor())
+    monkeypatch.setattr(app.state, "decision_gate", Gate())
+    monkeypatch.setattr(app.state, "recommender", Recommender())
+    monkeypatch.setattr(app.state, "override_engine", OverrideEngine(load_config()))
+
+
+def test_checkout_quote_applies_offer_only_to_eligible_product(client, monkeypatch):
+    _stub_checkout_pipeline(
+        monkeypatch,
+        decision="INTERVENTION_REQUIRED",
+        risk_level="HIGH",
+        events=[{"product_id": "P-1001", "event_type": "add_to_cart"}],
+    )
+
+    res = client.post(
+        "/api/checkout/quote",
+        json={
+            "customer_id": "C-CHECKOUT",
+            "lines": [
+                {"product_id": "P-1001", "quantity": 1},
+                {"product_id": "P-1002", "quantity": 1},
+            ],
+        },
+    )
+
+    assert res.status_code == 200
+    data = res.json()
+    assert data["subtotal"] == 3648
+    assert data["discount_value"] == 217.35
+    assert data["lines"][0]["discount_percent"] == 15
+    assert data["lines"][0]["line_total"] == 1231.65
+    assert data["lines"][1]["discount_percent"] == 0
+    assert data["lines"][1]["line_total"] == 2199
+    assert data["tax"] == 274.45
+    assert data["total"] == 3705.1
+
+    experience = client.get("/api/experience/C-CHECKOUT").json()
+    assert experience["discount"] == 0
+    assert {
+        item["product_id"]: item["discount"]
+        for item in experience["recommendations"]
+    }["P-1001"] == 15
+    assert next(
+        item["discount"]
+        for item in experience["recommendations"]
+        if item["product_id"] == "P-1002"
+    ) == 0
+
+
+def test_checkout_quote_has_no_discount_without_intervention(client, monkeypatch):
+    _stub_checkout_pipeline(
+        monkeypatch,
+        decision="NORMAL",
+        risk_level="LOW",
+        events=[{"product_id": "P-1001", "event_type": "add_to_cart"}],
+    )
+
+    res = client.post(
+        "/api/checkout/quote",
+        json={
+            "customer_id": "C-CHECKOUT",
+            "lines": [{"product_id": "P-1001", "quantity": 1}],
+        },
+    )
+
+    assert res.status_code == 200
+    data = res.json()
+    assert data["discount_value"] == 0
+    assert data["lines"][0]["discount_percent"] == 0
+    assert data["lines"][0]["line_total"] == 1449
+
+
+def test_checkout_quote_with_no_eligible_product_has_no_cart_wide_offer(client, monkeypatch):
+    _stub_checkout_pipeline(
+        monkeypatch,
+        decision="INTERVENTION_REQUIRED",
+        risk_level="HIGH",
+        events=[],
+    )
+
+    res = client.post(
+        "/api/checkout/quote",
+        json={
+            "customer_id": "C-CHECKOUT",
+            "lines": [{"product_id": "P-1001", "quantity": 1}],
+        },
+    )
+
+    assert res.status_code == 200
+    data = res.json()
+    assert data["discount_value"] == 0
+    assert data["lines"][0]["discount_percent"] == 0
+
+
+def test_checkout_quote_rejects_unknown_catalog_product(client):
+    res = client.post(
+        "/api/checkout/quote",
+        json={
+            "customer_id": "C-CHECKOUT",
+            "lines": [{"product_id": "UNKNOWN", "quantity": 1}],
+        },
+    )
+
+    assert res.status_code == 422
+
+
+def test_checkout_quote_rejects_client_claimed_offer_or_price(client):
+    res = client.post(
+        "/api/checkout/quote",
+        json={
+            "customer_id": "C-CHECKOUT",
+            "churn_probability": 1,
+            "discount": 100,
+            "eligible": True,
+            "lines": [
+                {
+                    "product_id": "P-1001",
+                    "quantity": 1,
+                    "price": 0,
+                    "discount_percent": 100,
+                }
+            ],
+        },
+    )
+
+    assert res.status_code == 422
+
+
+def test_local_demo_groups_gate_quotes_and_direct_event_offers(client, monkeypatch):
+    from src.demo_mode import DEMO_AT_RISK_CUSTOMERS, DEMO_NOT_AT_RISK_CUSTOMERS
+
+    monkeypatch.setattr(app.state, "local_demo_enabled", True)
+
+    for customer_id in DEMO_AT_RISK_CUSTOMERS | DEMO_NOT_AT_RISK_CUSTOMERS:
+        _stub_checkout_pipeline(
+            monkeypatch,
+            decision="INTERVENTION_REQUIRED",
+            risk_level="HIGH",
+            events=[{"product_id": "P-1001", "event_type": "add_to_cart"}],
+        )
+        app.state.state_manager.customer_history = {
+            customer_id: [{"product_id": "P-1001", "event_type": "add_to_cart"}]
+        }
+
+        experience = client.get(f"/api/experience/{customer_id}").json()
+        quote = client.post(
+            "/api/checkout/quote",
+            json={
+                "customer_id": customer_id,
+                "lines": [{"product_id": "P-1001", "quantity": 1}],
+            },
+        ).json()
+
+        if customer_id in DEMO_AT_RISK_CUSTOMERS:
+            assert experience["demo_classification"] == "DEMO_AT_RISK"
+            assert experience["decision"] == "INTERVENTION_REQUIRED"
+            assert quote["lines"][0]["discount_percent"] == 15
+        else:
+            assert experience["demo_classification"] == "DEMO_NOT_AT_RISK"
+            assert experience["decision"] == "INTERVENTION_REQUIRED"
+            assert all(item["discount"] == 0 for item in experience["recommendations"])
+            assert quote["lines"][0]["discount_percent"] == 0
+
+            event_response = client.post(
+                "/api/events",
+                json={
+                    "customer_id": customer_id,
+                    "session_id": "S-demo-denial",
+                    "event_type": "add_to_cart",
+                    "product_id": "P-1001",
+                },
+            )
+            assert event_response.status_code == 200
+            assert all(item["discount"] == 0 for item in event_response.json()["recommendations"])
+
+            finalized = client.post(
+                "/api/checkout/finalize",
+                json={
+                    "order_id": f"ORD-DENY-{customer_id}",
+                    "customer_id": customer_id,
+                    "lines": [{"product_id": "P-1001", "quantity": 1}],
+                },
+            )
+            assert finalized.status_code == 200
+            assert finalized.json()["retention_offer_status"] == "NOT_REDEEMED"
+            assert finalized.json()["discount_value"] == 0
+
+
+def test_checkout_finalization_is_idempotent_and_consumes_offer_once(client, monkeypatch):
+    monkeypatch.setattr(app.state, "local_demo_enabled", True)
+    _stub_checkout_pipeline(
+        monkeypatch,
+        decision="INTERVENTION_REQUIRED",
+        risk_level="HIGH",
+        events=[{"product_id": "P-1001", "event_type": "add_to_cart"}],
+    )
+    app.state.state_manager.customer_history = {
+        "C-1000": [{"product_id": "P-1001", "event_type": "add_to_cart"}]
+    }
+    payload = {
+        "order_id": "ORD-IDEMPOTENT-DEMO",
+        "customer_id": "C-1000",
+        "lines": [{"product_id": "P-1001", "quantity": 1}],
+    }
+
+    preview = client.post("/api/checkout/quote", json={
+        "customer_id": payload["customer_id"],
+        "lines": payload["lines"],
+    }).json()
+    assert preview["discount_value"] == 217.35
+
+    finalized = client.post("/api/checkout/finalize", json=payload)
+    repeated = client.post("/api/checkout/finalize", json=payload)
+    assert finalized.status_code == repeated.status_code == 200
+    assert finalized.json() == repeated.json()
+    assert finalized.json()["retention_offer_status"] == "REDEEMED"
+    assert finalized.json()["discount_value"] == 217.35
+
+    next_order = client.post(
+        "/api/checkout/finalize",
+        json={
+            **payload,
+            "order_id": "ORD-SECOND-DEMO",
+        },
+    )
+    assert next_order.status_code == 200
+    assert next_order.json()["discount_value"] == 0
+    assert next_order.json()["retention_offer_status"] == "NOT_REDEEMED"
+
+    conflict = client.post(
+        "/api/checkout/finalize",
+        json={
+            **payload,
+            "customer_id": "C-1002",
+        },
+    )
+    assert conflict.status_code == 409
+
+
+def test_concurrent_checkouts_cannot_redeem_the_same_product_offer(client, monkeypatch):
+    monkeypatch.setattr(app.state, "local_demo_enabled", True)
+    _stub_checkout_pipeline(
+        monkeypatch,
+        decision="INTERVENTION_REQUIRED",
+        risk_level="HIGH",
+        events=[{"product_id": "P-1001", "event_type": "add_to_cart"}],
+    )
+    app.state.state_manager.customer_history = {
+        "C-1000": [{"product_id": "P-1001", "event_type": "add_to_cart"}]
+    }
+
+    def finalize(order_id):
+        with TestClient(app) as concurrent_client:
+            return concurrent_client.post(
+                "/api/checkout/finalize",
+                json={
+                    "order_id": order_id,
+                    "customer_id": "C-1000",
+                    "lines": [{"product_id": "P-1001", "quantity": 1}],
+                },
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        responses = list(executor.map(finalize, ["ORD-CONCURRENT-1", "ORD-CONCURRENT-2"]))
+
+    assert all(response.status_code == 200 for response in responses)
+    assert sorted(response.json()["discount_value"] for response in responses) == [
+        0,
+        217.35,
+    ]
+
+
+def test_concurrent_retries_of_one_order_finalize_only_once(client, monkeypatch):
+    monkeypatch.setattr(app.state, "local_demo_enabled", True)
+    _stub_checkout_pipeline(
+        monkeypatch,
+        decision="INTERVENTION_REQUIRED",
+        risk_level="HIGH",
+        events=[{"product_id": "P-1001", "event_type": "add_to_cart"}],
+    )
+    app.state.state_manager.customer_history = {
+        "C-1000": [{"product_id": "P-1001", "event_type": "add_to_cart"}]
+    }
+
+    def finalize(_):
+        with TestClient(app) as concurrent_client:
+            return concurrent_client.post(
+                "/api/checkout/finalize",
+                json={
+                    "order_id": "ORD-CONCURRENT-RETRY",
+                    "customer_id": "C-1000",
+                    "lines": [{"product_id": "P-1001", "quantity": 1}],
+                },
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        responses = list(executor.map(finalize, range(2)))
+
+    assert all(response.status_code == 200 for response in responses)
+    assert responses[0].json() == responses[1].json()
+    with app.state.checkout_ledger.transaction() as connection:
+        order_count = connection.execute(
+            "SELECT COUNT(*) FROM finalized_checkouts WHERE order_id = ?",
+            ("ORD-CONCURRENT-RETRY",),
+        ).fetchone()[0]
+        redemption_count = connection.execute(
+            "SELECT COUNT(*) FROM redeemed_offers WHERE order_id = ?",
+            ("ORD-CONCURRENT-RETRY",),
+        ).fetchone()[0]
+    assert order_count == 1
+    assert redemption_count == 1
+
+
+def test_checkout_redemption_and_idempotency_survive_app_restart(
+    client, monkeypatch
+):
+    monkeypatch.setattr(app.state, "local_demo_enabled", True)
+    _stub_checkout_pipeline(
+        monkeypatch,
+        decision="INTERVENTION_REQUIRED",
+        risk_level="HIGH",
+        events=[{"product_id": "P-1001", "event_type": "add_to_cart"}],
+    )
+    app.state.state_manager.customer_history = {
+        "C-1000": [{"product_id": "P-1001", "event_type": "add_to_cart"}]
+    }
+    ledger_path = app.state.checkout_ledger.path
+    payload = {
+        "order_id": "ORD-PERSISTED",
+        "customer_id": "C-1000",
+        "lines": [{"product_id": "P-1001", "quantity": 1}],
+    }
+    first = client.post("/api/checkout/finalize", json=payload)
+    assert first.status_code == 200
+    assert first.json()["discount_value"] == 217.35
+
+    restarted_app = create_app(
+        config=app.state.config,
+        state_manager=app.state.state_manager,
+        predictor=app.state.predictor,
+        decision_gate=app.state.decision_gate,
+        recommender=app.state.recommender,
+        override_engine=app.state.override_engine,
+        checkout_ledger=CheckoutLedger(ledger_path),
+    )
+    restarted_app.state.local_demo_enabled = True
+    with TestClient(restarted_app) as restarted_client:
+        retry = restarted_client.post("/api/checkout/finalize", json=payload)
+        next_order = restarted_client.post(
+            "/api/checkout/finalize",
+            json={**payload, "order_id": "ORD-AFTER-RESTART"},
+        )
+
+    assert retry.status_code == 200
+    assert retry.json() == first.json()
+    assert next_order.status_code == 200
+    assert next_order.json()["discount_value"] == 0
+    assert next_order.json()["retention_offer_status"] == "NOT_REDEEMED"
+
+
+def test_production_requires_explicit_demo_cors_and_persistent_ledger_config(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("CHURN_ENVIRONMENT", "production")
+    monkeypatch.setenv("CHURN_LOCAL_DEMO_MODE", "false")
+    monkeypatch.setenv("CORS_ORIGINS", "https://shop.example.com")
+    monkeypatch.delenv("CHECKOUT_LEDGER_PATH", raising=False)
+    dependencies = {
+        "config": app.state.config,
+        "state_manager": app.state.state_manager,
+        "predictor": app.state.predictor,
+        "decision_gate": app.state.decision_gate,
+        "recommender": app.state.recommender,
+        "override_engine": app.state.override_engine,
+    }
+
+    with pytest.raises(RuntimeError, match="CHECKOUT_LEDGER_PATH"):
+        create_app(**dependencies)
+
+    ledger_path = tmp_path / "persistent" / "checkout.sqlite3"
+    ledger_path.parent.mkdir()
+    monkeypatch.setenv("CHECKOUT_LEDGER_PATH", str(ledger_path))
+    production_app = create_app(**dependencies)
+
+    assert production_app.state.local_demo_enabled is False
+    assert production_app.state.checkout_ledger.path == ledger_path
+    assert ledger_path.exists()
+
+
+def test_production_rejects_local_cors_origins(monkeypatch, tmp_path):
+    monkeypatch.setenv("CHURN_ENVIRONMENT", "production")
+    monkeypatch.setenv("CHURN_LOCAL_DEMO_MODE", "false")
+    monkeypatch.setenv("CORS_ORIGINS", "http://localhost:5173")
+    monkeypatch.setenv(
+        "CHECKOUT_LEDGER_PATH", str(tmp_path / "checkout.sqlite3")
+    )
+    dependencies = {
+        "config": app.state.config,
+        "state_manager": app.state.state_manager,
+        "predictor": app.state.predictor,
+        "decision_gate": app.state.decision_gate,
+        "recommender": app.state.recommender,
+        "override_engine": app.state.override_engine,
+    }
+
+    with pytest.raises(RuntimeError, match="public HTTPS frontend origins"):
+        create_app(**dependencies)
+
+
+def test_local_demo_flag_is_explicit_local_only(monkeypatch):
+    from src.demo_mode import local_demo_enabled
+
+    config = {"project": {"environment": "development"}}
+    monkeypatch.setenv("CHURN_LOCAL_DEMO_MODE", "true")
+    monkeypatch.setenv("CHURN_ENVIRONMENT", "local")
+    assert local_demo_enabled(config) is True
+
+    monkeypatch.setenv("CHURN_ENVIRONMENT", "production")
+    assert local_demo_enabled(config) is False
+
+    monkeypatch.setenv("CHURN_ENVIRONMENT", "local")
+    monkeypatch.setenv("RENDER", "true")
+    assert local_demo_enabled(config) is False
+
+    monkeypatch.delenv("RENDER")
+    assert local_demo_enabled({"project": {"environment": "production"}}) is False
+
+
+def test_model_and_authoritative_threshold_remain_unchanged(client):
+    response = client.get("/health")
+    assert response.status_code == 200
+    assert response.json()["model_type"] == "RandomForestClassifier"
+    assert response.json()["threshold"] == 0.5
+
+
 def test_simulation_mode_and_live_store_mode_isolation():
     """Test 16: Simulation Mode generates synthetic events; Live Store Mode stops simulator and isolates events."""
     import time
@@ -314,5 +822,3 @@ def test_simulation_mode_and_live_store_mode_isolation():
     # Verify no new synthetic events are generated when stopped
     time.sleep(0.3)
     assert sm.get_stats()["total_events"] == initial_sim_count
-
-

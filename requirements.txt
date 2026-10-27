@@ -2,9 +2,10 @@
 pandas==2.2.3
 numpy==2.2.6
 scipy==1.15.3
+pyarrow==20.0.0
 
 # Machine learning
-scikit-learn==1.6.1
+scikit-learn==1.7.1
 xgboost==2.1.4
 joblib==1.4.2
 
@@ -23,7 +24,7 @@ streamlit==1.45.1
 # Utilities
 python-dotenv==1.1.0
 pydantic==2.11.5
-PyYAML==6.0.2
+PyYAML==6.0.3
 tqdm==4.67.1
 colorlog==6.9.0
 

@@ -7,7 +7,6 @@ Evaluation Page — Multi-Model Benchmark, Threshold Tuning & Visualisations.
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -22,15 +21,15 @@ def _style_chart(fig: go.Figure, height: int) -> go.Figure:
     fig.update_layout(
         template="plotly_white",
         height=height,
-        font={"family": "Inter, sans-serif", "size": 12, "color": "#424a53"},
-        title={"x": 0, "xanchor": "left", "font": {"size": 16, "color": "#1f2328"}},
+        font={"family": "Inter, sans-serif", "size": 12, "color": "#4B5563"},
+        title={"x": 0, "xanchor": "left", "font": {"size": 16, "color": "#1F2937"}},
         margin={"l": 48, "r": 24, "t": 64, "b": 48},
         plot_bgcolor="#ffffff",
         paper_bgcolor="#ffffff",
         legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "right", "x": 1},
     )
-    fig.update_xaxes(showgrid=False, zeroline=False, linecolor="#d0d7de", ticks="outside")
-    fig.update_yaxes(showgrid=True, gridcolor="#eaeef2", zeroline=False, linecolor="#d0d7de")
+    fig.update_xaxes(showgrid=False, zeroline=False, linecolor="#E1E5EB", ticks="outside")
+    fig.update_yaxes(showgrid=True, gridcolor="#EBEEF2", zeroline=False, linecolor="#E1E5EB")
     return fig
 
 
@@ -39,7 +38,7 @@ def render() -> None:
 
     st.markdown("""
     <div class="page-header">
-        <h1 class="page-title">🧪 Model Evaluation</h1>
+        <h1 class="page-title">Offline Model Evaluation</h1>
         <p class="page-subtitle">
             Multi-model benchmark · threshold optimisation · performance diagnostics
         </p>
@@ -53,7 +52,6 @@ def render() -> None:
     meta_path = root / config["paths"]["models"] / "model_metadata.json"
     policy_path = root / config["paths"]["models"] / "decision_policy.json"
     report_path = root / config["paths"]["logs"] / "evaluation_report.json"
-    exp_path = root / config["paths"]["reports"] / "experiment_history.csv"
     sample_path = root / config["paths"]["reports"] / "sample_predictions.csv"
     features_path = root / config["paths"]["data_features"] / "customer_features.parquet"
 
@@ -93,176 +91,143 @@ def render() -> None:
         with open(report_path, "r", encoding="utf-8") as f:
             report = json.load(f)
 
-    winning_model = meta.get("model_name", meta.get("model_type", "XGBClassifier"))
+    st.markdown("### A. Offline model evaluation")
+    st.caption(
+        "Historical test-set and benchmark artifacts. These metrics do not describe "
+        "current production performance or prove runtime model identity."
+    )
+    winning_model = meta.get("model_name", meta.get("model_type"))
+    st.write(f"Model recorded in offline metadata: **{winning_model or 'Not specified'}**")
 
-    # --- WHY THIS MODEL? ---
-    st.markdown("### 🏆 Selected Model")
-    col_win1, col_win2 = st.columns([1, 2])
-    with col_win1:
-        st.markdown(f"""
-        <div style="background:#ffffff; border:1px solid #d0d7de; border-left:4px solid #1a7f37; border-radius:8px; padding:1.25rem 1.5rem; box-shadow:0 1px 2px rgba(31,35,40,0.04);">
-            <div style="font-size:0.72rem; font-weight:600; color:#656d76; text-transform:uppercase; letter-spacing:0.05em;">Winning Model</div>
-            <div style="font-size:1.45rem; font-weight:700; color:#1f2328; margin:0.4rem 0;">{winning_model}</div>
-            <div style="font-size:0.85rem; color:#656d76;">Selected threshold: {meta.get("selected_threshold", 0.5):.2f}</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with col_win2:
-        st.markdown("#### Why this model?")
-        st.markdown(f"""
-        **{winning_model}** was selected because it achieved the **strongest validation performance**
-        among the three evaluated candidates (Logistic Regression, Random Forest, XGBoost).
+    m = meta.get("test_metrics") or {}
+    available_metrics = [
+        {"Metric": label, "Value": m[key]}
+        for key, label in [
+            ("roc_auc", "ROC-AUC"),
+            ("f1", "F1 score"),
+            ("mcc", "Matthews correlation coefficient"),
+            ("precision", "Precision"),
+            ("recall", "Recall"),
+        ]
+        if key in m and m[key] is not None
+    ]
+    if available_metrics:
+        metrics_df = pd.DataFrame(available_metrics)
+        metrics_df["Value"] = metrics_df["Value"].map(
+            lambda value: f"{value:.4f}" if isinstance(value, (int, float)) else str(value)
+        )
+        st.dataframe(metrics_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("Offline test metrics are unavailable in the model metadata.")
 
-        Selection criteria prioritised **ROC-AUC** (area under the receiver operating characteristic curve),
-        followed by **F1 Score** as a tiebreaker — balancing precision and recall for a business use case
-        where both false positives (wasted discount spend) and false negatives (undetected churners) carry cost.
-        """)
-
-    st.markdown("---")
-
-    # Top Metric KPI Cards
-    st.markdown("### 📊 Test Set Performance Metrics")
-    m = meta.get("test_metrics", {})
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("ROC-AUC", f"{m.get('roc_auc', 0.0):.4f}")
-    with col2:
-        st.metric("F1 Score", f"{m.get('f1', 0.0):.4f}")
-    with col3:
-        st.metric("MCC", f"{m.get('mcc', 0.0):.4f}")
-
-    col4, col5, col6 = st.columns(3)
-    with col4:
-        st.metric("Precision", f"{m.get('precision', 0.0):.4f}")
-    with col5:
-        st.metric("Recall", f"{m.get('recall', 0.0):.4f}")
-    with col6:
-        st.metric("Optimal Cutoff", f"{meta.get('selected_threshold', 0.5):.2f}")
-
-    st.markdown("---")
-
-    # --- Section 1: Multi-Model Benchmark Comparison Table ---
-    st.markdown("### 🏎️ Multi-Model Benchmark Comparison")
-    st.caption("Candidates evaluated on validation set. Winner selected based on highest ROC-AUC.")
-
-    bench_data = report.get("benchmark_summary", [])
+    st.markdown("#### Model comparison")
+    bench_data = report.get("benchmark_summary") or []
     if bench_data:
         df_b = pd.DataFrame(bench_data)
         st.dataframe(df_b.style.format(precision=4), use_container_width=True, hide_index=True)
     else:
-        st.info("Benchmark summary data unavailable.")
+        st.info("Historical benchmark comparison is unavailable.")
 
-    st.markdown("---")
+    st.markdown("#### Offline decision-threshold analysis")
+    offline_threshold = meta.get("selected_threshold")
+    if offline_threshold is None:
+        offline_threshold = policy.get("selected_threshold")
+    if offline_threshold is not None:
+        st.caption(f"Threshold recorded in offline artifacts: **{float(offline_threshold):.2f}**")
+    else:
+        st.caption("Offline threshold: Unavailable")
 
-    # --- Section 2: Decision Policy & Threshold Optimization ---
-    st.markdown("### 🚦 Decision Policy & Threshold Optimization")
-
-    col_left, col_right = st.columns([1, 1])
-
-    with col_left:
-        st.markdown("#### Selected Decision Policy (`decision_policy.json`)")
-        st.json(policy)
-
-    with col_right:
-        st.markdown("#### Threshold Sensitivity Analysis")
-        # Recompute threshold metrics from exported test predictions.
-        thresholds = [0.30, 0.40, 0.50, 0.60, 0.70, 0.80]
-        # Re-compute or render sensitivity
-        if sample_path.exists():
-            df_samp = pd.read_csv(sample_path)
-            y_t = df_samp["actual_label"]
-            y_p = df_samp["predicted_probability"]
+    if sample_path.exists():
+        df_samp = pd.read_csv(sample_path)
+        required_columns = {"actual_label", "predicted_probability"}
+        if required_columns.issubset(df_samp.columns) and not df_samp.empty:
+            thresholds = [0.30, 0.40, 0.50, 0.60, 0.70, 0.80]
             from src.evaluation import evaluate_thresholds
-            df_thresh = evaluate_thresholds(y_t, y_p, thresholds)[0]
-
+            df_thresh = evaluate_thresholds(
+                df_samp["actual_label"],
+                df_samp["predicted_probability"],
+                thresholds,
+            )[0]
             fig_t = go.Figure()
-            fig_t.add_trace(go.Scatter(x=df_thresh["threshold"], y=df_thresh["f1"], name="F1 Score", mode="lines+markers", line={"color": "#0969da", "width": 2.5}))
-            fig_t.add_trace(go.Scatter(x=df_thresh["threshold"], y=df_thresh["precision"], name="Precision", mode="lines+markers", line={"color": "#1a7f37", "width": 2}))
-            fig_t.add_trace(go.Scatter(x=df_thresh["threshold"], y=df_thresh["recall"], name="Recall", mode="lines+markers", line={"color": "#9a6700", "width": 2}))
-            fig_t.add_trace(go.Scatter(x=df_thresh["threshold"], y=df_thresh["fpr"], name="FPR", mode="lines+markers", line={"dash": "dash", "color": "#cf222e", "width": 2}))
-
-            fig_t.add_vline(x=meta.get("selected_threshold", 0.5), line_dash="dot", line_color="#656d76", annotation_text=f"Selected ({meta.get('selected_threshold', 0.5):.2f})")
-            _style_chart(fig_t, height=360)
-            fig_t.update_layout(title="Metrics vs Decision Threshold", xaxis_title="Decision threshold", yaxis_title="Metric score")
+            for metric, color in [
+                ("f1", "#4263A5"),
+                ("precision", "#10B981"),
+                ("recall", "#F59E0B"),
+            ]:
+                if metric in df_thresh:
+                    fig_t.add_trace(go.Scatter(
+                        x=df_thresh["threshold"],
+                        y=df_thresh[metric],
+                        name=metric.replace("_", " ").title(),
+                        mode="lines+markers",
+                        line={"color": color, "width": 2},
+                    ))
+            if offline_threshold is not None:
+                fig_t.add_vline(
+                    x=float(offline_threshold),
+                    line_dash="dot",
+                    line_color="#6B7280",
+                    annotation_text="Recorded offline threshold",
+                )
+            _style_chart(fig_t, height=330)
+            fig_t.update_layout(
+                title="Offline test metrics by decision threshold",
+                xaxis_title="Decision threshold",
+                yaxis_title="Metric score",
+            )
             st.plotly_chart(fig_t, use_container_width=True)
-
-    st.markdown("---")
-
-    # --- Section 3: Diagnostic Visualisations Tabs ---
-    st.markdown("### 🔍 Model Diagnostic Visualisations")
-
-    t1, t2, t3, t4, t5 = st.tabs([
-        "📊 Probability Distribution",
-        "🔢 Confusion Matrix",
-        "📋 Feature Importances",
-        "📜 Experiment Log History",
-        "🎯 Sample Test Predictions"
-    ])
-
-    with t1:
-        if sample_path.exists():
-            df_s = pd.read_csv(sample_path)
-            fig_dist = px.histogram(
-                df_s, x="predicted_probability", color="actual_label",
-                barmode="overlay", nbins=30,
-                color_discrete_map={0: "#1a7f37", 1: "#cf222e"},
-                title="Predicted Churn Probability Distribution (Churned vs Retained)",
-                labels={"actual_label": "Actual outcome", "predicted_probability": "Predicted churn probability"}
-            )
-            fig_dist.add_vline(x=meta.get("selected_threshold", 0.5), line_dash="dash", line_color="#656d76", annotation_text="Selected cutoff")
-            fig_dist.for_each_trace(lambda trace: trace.update(name={"0": "Retained (0)", "1": "Churned (1)"}.get(trace.name, trace.name)))
-            _style_chart(fig_dist, height=420)
-            fig_dist.update_layout(title="Predicted churn probability distribution")
-            fig_dist.update_xaxes(title_text="Predicted churn probability")
-            fig_dist.update_yaxes(title_text="Customer count")
-            st.plotly_chart(fig_dist, use_container_width=True)
-
-    with t2:
-        cm_data = report.get("confusion_matrix", [[0, 0], [0, 0]])
-        cm_arr = np.array(cm_data)
-        fig_cm = px.imshow(
-            cm_arr, text_auto=True,
-            x=["Predicted Retained (0)", "Predicted Churned (1)"],
-            y=["Actual Retained (0)", "Actual Churned (1)"],
-            color_continuous_scale="Blues",
-            title="Confusion Matrix Heatmap"
-        )
-        _style_chart(fig_cm, height=400)
-        fig_cm.update_layout(coloraxis_colorbar_title="Customers")
-        fig_cm.update_xaxes(title_text="Predicted outcome")
-        fig_cm.update_yaxes(title_text="Actual outcome")
-        st.plotly_chart(fig_cm, use_container_width=True)
-
-    with t3:
-        if features_path.exists() and model_path.exists():
-            import joblib
-            pipeline = joblib.load(model_path)
-            feat_names = pipeline.feature_names
-            if hasattr(pipeline.model, "feature_importances_"):
-                imps = pipeline.model.feature_importances_
-            else:
-                imps = np.abs(getattr(pipeline.model, "coef_", [np.zeros(len(feat_names))])[0])
-
-            df_imp = pd.DataFrame({"Feature": feat_names, "Importance": imps}).sort_values("Importance", ascending=False).head(20)
-            fig_imp = px.bar(
-                df_imp, x="Importance", y="Feature", orientation="h",
-                title="Top 20 Feature Importances"
-            )
-            fig_imp.update_traces(marker_color="#0969da")
-            _style_chart(fig_imp, height=480)
-            fig_imp.update_layout(showlegend=False)
-            fig_imp.update_xaxes(title_text="Importance")
-            fig_imp.update_yaxes(title_text="Feature", autorange="reversed")
-            st.plotly_chart(fig_imp, use_container_width=True)
-
-    with t4:
-        if exp_path.exists():
-            df_exp = pd.read_csv(exp_path)
-            st.dataframe(df_exp.style.format(precision=4), use_container_width=True, hide_index=True)
         else:
-            st.info("No experiment history logged yet.")
+            st.info("Offline threshold analysis is unavailable: prediction artifact columns are missing.")
+    else:
+        st.info("Offline threshold analysis is unavailable because sample predictions were not exported.")
 
-    with t5:
-        if sample_path.exists():
-            df_samp = pd.read_csv(sample_path)
-            st.dataframe(df_samp.head(100).style.format(precision=4), use_container_width=True, hide_index=True)
-            st.caption(f"Showing sample test predictions ({len(df_samp)} rows exported to `reports/sample_predictions.csv`).")
+    confusion_matrix = report.get("confusion_matrix")
+    if confusion_matrix is not None:
+        cm_arr = np.asarray(confusion_matrix)
+        if cm_arr.shape == (2, 2):
+            st.markdown("#### Offline confusion matrix")
+            fig_cm = px.imshow(
+                cm_arr,
+                text_auto=True,
+                x=["Predicted retained", "Predicted churned"],
+                y=["Actual retained", "Actual churned"],
+                color_continuous_scale="Blues",
+            )
+            _style_chart(fig_cm, height=330)
+            fig_cm.update_layout(coloraxis_colorbar_title="Customers")
+            st.plotly_chart(fig_cm, use_container_width=True)
+        else:
+            st.info("Offline confusion matrix is unavailable or has an unsupported shape.")
+    else:
+        st.info("Offline confusion matrix is unavailable.")
+
+    if features_path.exists() and model_path.exists():
+        import joblib
+        pipeline = joblib.load(model_path)
+        feat_names = getattr(pipeline, "feature_names", None)
+        model = getattr(pipeline, "model", None)
+        if feat_names is not None and len(feat_names) > 0 and model is not None:
+            if hasattr(model, "feature_importances_"):
+                importances = model.feature_importances_
+            elif hasattr(model, "coef_"):
+                importances = np.abs(model.coef_[0])
+            else:
+                importances = None
+
+            if importances is not None and len(importances) == len(feat_names):
+                st.markdown("#### Loaded artifact feature importance")
+                st.caption("Derived from the local model artifact; not a production performance metric.")
+                df_imp = pd.DataFrame({
+                    "Feature": feat_names,
+                    "Importance": importances,
+                }).sort_values("Importance", ascending=False).head(15)
+                fig_imp = px.bar(
+                    df_imp,
+                    x="Importance",
+                    y="Feature",
+                    orientation="h",
+                    template="plotly_white",
+                )
+                fig_imp.update_layout(height=380, yaxis={"autorange": "reversed"})
+                fig_imp.update_traces(marker_color="#4263A5")
+                st.plotly_chart(fig_imp, use_container_width=True)

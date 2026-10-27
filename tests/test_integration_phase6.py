@@ -87,7 +87,8 @@ def test_integration_phase6_flow(config):
     assert final_high["metadata"]["override_triggered"] is True
     assert final_high["metadata"]["discount_pct"] == 25
     
-    # Recommendations replaced with coupon and bundle
+    # Recommendations include a bundle, but never a blanket discount coupon.
     pids = [r["product_id"] for r in final_high["recommendations"]]
-    assert "COUPON-CRIT-25" in pids
+    assert not any(pid.startswith("COUPON-") for pid in pids)
     assert "P-101-BNDL" in pids  # bundle associated with P-101 viewed
+    assert any(r["product_id"] == "P-101" and r["discount"] == 25 for r in final_high["recommendations"])

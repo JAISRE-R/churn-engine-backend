@@ -100,7 +100,7 @@ def test_override_engine_risk_tier_strategies(config):
     }
     res_high = engine.process(baseline, dec_high, None)
     assert res_high["metadata"]["discount_pct"] == 15
-    assert any("COUPON-SOFT-15" in r["product_id"] for r in res_high["recommendations"])
+    assert all(r.get("discount", 0) == 0 for r in res_high["recommendations"])
 
     # Test CRITICAL risk strategy (25% discount, bundle deal, etc.)
     dec_crit = {
@@ -112,8 +112,136 @@ def test_override_engine_risk_tier_strategies(config):
     }
     res_crit = engine.process(baseline, dec_crit, None)
     assert res_crit["metadata"]["discount_pct"] == 25
-    assert any("COUPON-CRIT-25" in r["product_id"] for r in res_crit["recommendations"])
     assert any("BNDL" in r["product_id"] for r in res_crit["recommendations"])
+    assert all(r.get("discount", 0) == 0 for r in res_crit["recommendations"])
+
+
+def test_override_engine_targets_offers_to_eligible_products(config):
+    engine = OverrideEngine(config)
+    baseline = {
+        "customer_id": "C-1",
+        "recommendations": [
+            {"product_id": "P-1002", "category": "Laptops", "reason": "Baseline", "score": 0.8}
+        ],
+        "strategy": "BASELINE",
+        "timestamp": "2026-01-01 10:00:00",
+    }
+    decision = {
+        "customer_id": "C-1",
+        "churn_probability": 0.65,
+        "threshold": 0.40,
+        "decision": "INTERVENTION_REQUIRED",
+        "risk_level": "HIGH",
+    }
+    events = [
+        {"product_id": "P-1001", "event_type": "add_to_cart"},
+        {"product_id": "P-1003", "event_type": "product_click"},
+    ]
+
+    result = engine.process(baseline, decision, events)
+    offers = {
+        item["product_id"]: item["discount"]
+        for item in result["recommendations"]
+        if item.get("discount", 0) > 0
+    }
+
+    assert offers == {"P-1001": 15, "P-1003": 15}
+    assert next(item for item in result["recommendations"] if item["product_id"] == "P-1002").get(
+        "discount", 0
+    ) == 0
+
+
+def test_intervention_without_eligible_products_has_no_offer(config):
+    engine = OverrideEngine(config)
+    baseline = {
+        "customer_id": "C-1",
+        "recommendations": [
+            {"product_id": "P-1002", "category": "Laptops", "reason": "Baseline", "score": 0.8}
+        ],
+        "strategy": "BASELINE",
+        "timestamp": "2026-01-01 10:00:00",
+    }
+    decision = {
+        "customer_id": "C-1",
+        "churn_probability": 0.65,
+        "threshold": 0.40,
+        "decision": "INTERVENTION_REQUIRED",
+        "risk_level": "HIGH",
+    }
+
+    result = engine.process(baseline, decision, [])
+
+    assert result["strategy"] == "RETENTION_OVERRIDE"
+    assert all(item.get("discount", 0) == 0 for item in result["recommendations"])
+
+
+def test_override_engine_rejects_unauthorized_customer_offers(config):
+    engine = OverrideEngine(config)
+    baseline = {
+        "customer_id": "C-1001",
+        "recommendations": [
+            {"product_id": "P-1001", "category": "Laptops", "reason": "Baseline", "score": 0.8}
+        ],
+        "strategy": "BASELINE",
+        "timestamp": "2026-01-01 10:00:00",
+    }
+    decision = {
+        "customer_id": "C-1001",
+        "churn_probability": 0.8,
+        "threshold": 0.5,
+        "decision": "INTERVENTION_REQUIRED",
+        "risk_level": "HIGH",
+    }
+    events = [{"product_id": "P-1001", "event_type": "add_to_cart"}]
+
+    result = engine.process(
+        baseline,
+        decision,
+        events,
+        offers_allowed=False,
+    )
+
+    assert result["strategy"] == "BASELINE"
+    assert result["metadata"]["override_triggered"] is False
+    assert "not authorized" in result["metadata"]["override_reason"]
+    assert all(item.get("discount", 0) == 0 for item in result["recommendations"])
+
+
+def test_local_demo_mapping_is_enforced_by_override_engine(config, monkeypatch):
+    from src.demo_mode import DEMO_AT_RISK_CUSTOMERS, DEMO_NOT_AT_RISK_CUSTOMERS
+
+    monkeypatch.setenv("CHURN_LOCAL_DEMO_MODE", "true")
+    monkeypatch.setenv("CHURN_ENVIRONMENT", "local")
+    for marker in ("RENDER", "FLY_APP_NAME", "DYNO", "K_SERVICE", "AWS_LAMBDA_FUNCTION_NAME", "WEBSITE_INSTANCE_ID"):
+        monkeypatch.delenv(marker, raising=False)
+
+    engine = OverrideEngine(config)
+    decision = {
+        "churn_probability": 0.8,
+        "threshold": 0.5,
+        "decision": "INTERVENTION_REQUIRED",
+        "risk_level": "HIGH",
+    }
+    events = [{"product_id": "P-1001", "event_type": "add_to_cart"}]
+
+    for customer_id in DEMO_AT_RISK_CUSTOMERS | DEMO_NOT_AT_RISK_CUSTOMERS:
+        baseline = {
+            "customer_id": customer_id,
+            "recommendations": [
+                {"product_id": "P-1002", "category": "Laptops", "reason": "Baseline", "score": 0.8}
+            ],
+            "strategy": "BASELINE",
+            "timestamp": "2026-01-01 10:00:00",
+        }
+        result = engine.process(baseline, decision, events)
+        offers = [
+            item for item in result["recommendations"]
+            if item.get("discount", 0) > 0
+        ]
+        if customer_id in DEMO_AT_RISK_CUSTOMERS:
+            assert [item["product_id"] for item in offers] == ["P-1001"]
+        else:
+            assert offers == []
 
 
 def test_override_engine_behavioral_affinity(config):

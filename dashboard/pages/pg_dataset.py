@@ -82,7 +82,7 @@ def render() -> None:
             val_report = json.load(f)
 
     # Top KPI Metrics
-    st.markdown("### 📈 Pipeline Summary Metrics")
+    st.markdown("### Pipeline summary")
     col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
         st.metric("Total Events", f"{len(df_raw):,}")
@@ -94,8 +94,12 @@ def render() -> None:
     with col4:
         st.metric("Feature Count", f"{df_features.shape[1] - 1}")
     with col5:
-        val_status = val_report.get("status", "UNKNOWN")
-        badge = "🟢 PASSED" if val_status == "PASSED" else "🟡 WARNINGS"
+        val_status = val_report.get("status")
+        badge = (
+            "Passed" if val_status == "PASSED"
+            else "Warnings" if val_status
+            else "Unavailable"
+        )
         st.metric("Data Health", badge)
 
     st.markdown("---")
@@ -107,7 +111,7 @@ def render() -> None:
         for check_name, details in val_report.get("checks", {}).items():
             checks_data.append({
                 "Validation Rule": check_name.replace("_", " ").title(),
-                "Failed Record Count": details.get("failed_count", 0),
+                "Failed Record Count": details.get("failed_count", "Unavailable"),
                 "Status": "✅ PASS" if details.get("status") == "PASSED" else "❌ FAIL",
             })
         st.dataframe(pd.DataFrame(checks_data), use_container_width=True, hide_index=True)
