@@ -170,23 +170,24 @@ Edit `configs/config.yaml` to adjust:
 ### Production checkout storage (Render)
 
 Checkout finalizations and redeemed product offers are stored transactionally
-in SQLite. For Render, attach a persistent disk to the backend service (for
-example mounted at `/var/data`) and configure:
+in SQLite. Configure a writable absolute path with an existing parent directory:
 
 ```text
 CHURN_ENVIRONMENT=production
 CHURN_LOCAL_DEMO_MODE=false
 CORS_ORIGINS=https://<published-storefront-origin>
-CHECKOUT_LEDGER_PATH=/var/data/checkout_ledger.sqlite3
+CHECKOUT_LEDGER_PATH=/tmp/checkout_ledger.sqlite3
 ```
 
 The API refuses production startup if the demo flag, public CORS origins, or
-ledger path is missing or invalid. The ledger path's parent must already exist,
-which prevents silently falling back to an ephemeral filesystem. SQLite on a
-Render persistent disk supports transactional retries and concurrent requests
-for a single backend instance; do not scale this service to multiple instances
-or workers sharing the ledger. Use a shared transactional database before
-horizontal scaling.
+ledger path is missing or invalid. A path under `/tmp` works on a Render free
+web service, but its contents are ephemeral: checkout finalization and offer
+redemption records can be lost when the service restarts or is redeployed.
+After such a loss, idempotency records and one-time offer redemption history
+are not recoverable. Use a Render persistent disk or shared transactional
+database when durable records are required. SQLite supports transactional
+retries and concurrent requests for a single backend instance; do not scale
+multiple instances or workers against one SQLite ledger.
 
 ---
 

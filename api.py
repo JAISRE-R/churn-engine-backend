@@ -63,6 +63,7 @@ from src.override_engine import OverrideEngine
 from src.checkout_ledger import CheckoutLedger
 from src.demo_mode import (
     DEMO_AT_RISK_CUSTOMERS,
+    DEMO_NOT_AT_RISK_CUSTOMERS,
     demo_classification,
     local_demo_enabled,
 )
@@ -269,6 +270,17 @@ class CustomerExperienceResponse(BaseModel):
     demo_classification: Optional[Literal["DEMO_AT_RISK", "DEMO_NOT_AT_RISK"]] = None
 
 
+class DemoCustomerOption(BaseModel):
+    customer_id: str
+    label: str
+
+
+class DemoCustomersResponse(BaseModel):
+    available: bool
+    demo_mode: bool
+    customers: list[DemoCustomerOption]
+
+
 class LiveEventRecord(BaseModel):
     timestamp: str
     customer_id: str
@@ -465,12 +477,12 @@ def create_app(
         if production:
             if not configured_ledger_path:
                 raise RuntimeError(
-                    "CHECKOUT_LEDGER_PATH must point to a Render persistent disk in production"
+                    "CHECKOUT_LEDGER_PATH must be explicitly configured in production"
                 )
             ledger_path = Path(configured_ledger_path).expanduser()
             if not ledger_path.is_absolute() or not ledger_path.parent.is_dir():
                 raise RuntimeError(
-                    "CHECKOUT_LEDGER_PATH must be an absolute path on an attached persistent disk"
+                    "CHECKOUT_LEDGER_PATH must be an absolute path with an existing parent directory"
                 )
         else:
             ledger_path = (
@@ -588,6 +600,23 @@ def create_app(
     # -----------------------------------------------------------------------
     # Routes
     # -----------------------------------------------------------------------
+
+    @app.get("/api/demo/customers", response_model=DemoCustomersResponse)
+    def get_demo_customers():
+        customers = [
+            DemoCustomerOption(
+                customer_id=customer_id,
+                label=f"Demo customer {customer_id}",
+            )
+            for customer_id in sorted(
+                DEMO_AT_RISK_CUSTOMERS | DEMO_NOT_AT_RISK_CUSTOMERS
+            )
+        ]
+        return DemoCustomersResponse(
+            available=bool(customers),
+            demo_mode=app.state.local_demo_enabled,
+            customers=customers,
+        )
 
     @app.get("/health", response_model=HealthResponse)
     def health_check():

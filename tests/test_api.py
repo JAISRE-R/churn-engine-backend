@@ -80,6 +80,29 @@ def test_get_experience_valid(client):
     assert data["strategy"] in ["BASELINE", "RETENTION_OVERRIDE"]
 
 
+def test_demo_customer_options_are_server_owned_and_do_not_enable_demo_mode(
+    client, monkeypatch
+):
+    from src.demo_mode import DEMO_AT_RISK_CUSTOMERS, DEMO_NOT_AT_RISK_CUSTOMERS
+
+    monkeypatch.setattr(app.state, "local_demo_enabled", False)
+    response = client.get("/api/demo/customers")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["available"] is True
+    assert data["demo_mode"] is False
+    assert {item["customer_id"] for item in data["customers"]} == (
+        DEMO_AT_RISK_CUSTOMERS | DEMO_NOT_AT_RISK_CUSTOMERS
+    )
+    assert all(item["label"].startswith("Demo customer ") for item in data["customers"])
+    assert all("classification" not in item for item in data["customers"])
+
+    monkeypatch.setattr(app.state, "local_demo_enabled", True)
+    local_demo = client.get("/api/demo/customers").json()
+    assert local_demo["available"] is True
+    assert local_demo["demo_mode"] is True
+
+
 def test_invalid_request_handling(client):
     """Test 4: Invalid requests return 422 Unprocessable Entity."""
     # Missing required fields customer_id and session_id
@@ -722,7 +745,7 @@ def test_checkout_redemption_and_idempotency_survive_app_restart(
     assert next_order.json()["retention_offer_status"] == "NOT_REDEEMED"
 
 
-def test_production_requires_explicit_demo_cors_and_persistent_ledger_config(
+def test_production_requires_explicit_demo_cors_and_ledger_config(
     monkeypatch, tmp_path
 ):
     monkeypatch.setenv("CHURN_ENVIRONMENT", "production")
@@ -741,13 +764,22 @@ def test_production_requires_explicit_demo_cors_and_persistent_ledger_config(
     with pytest.raises(RuntimeError, match="CHECKOUT_LEDGER_PATH"):
         create_app(**dependencies)
 
-    ledger_path = tmp_path / "persistent" / "checkout.sqlite3"
-    ledger_path.parent.mkdir()
-    monkeypatch.setenv("CHECKOUT_LEDGER_PATH", str(ledger_path))
+    temporary_path = tmp_path / "render-ephemeral" / "checkout.sqlite3"
+    temporary_path.parent.mkdir()
+    monkeypatch.setenv("CHECKOUT_LEDGER_PATH", str(temporary_path))
     production_app = create_app(**dependencies)
 
     assert production_app.state.local_demo_enabled is False
-    assert production_app.state.checkout_ledger.path == ledger_path
+    assert production_app.state.checkout_ledger.path == temporary_path
+    assert temporary_path.exists()
+
+    ledger_path = tmp_path / "persistent" / "checkout.sqlite3"
+    ledger_path.parent.mkdir()
+    monkeypatch.setenv("CHECKOUT_LEDGER_PATH", str(ledger_path))
+    persistent_app = create_app(**dependencies)
+
+    assert persistent_app.state.local_demo_enabled is False
+    assert persistent_app.state.checkout_ledger.path == ledger_path
     assert ledger_path.exists()
 
 
